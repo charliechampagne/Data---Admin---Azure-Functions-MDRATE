@@ -58,6 +58,21 @@ def sanitize_guid(g):
     return m.group(0) if m else s
 
 
+def normalize_multichoice(value: str) -> str:
+    """
+    Dataverse formats multi-select choice labels with semicolons like:
+      'A; B; C'
+    Convert to:
+      'A, B, C'
+    """
+    if not value:
+        return value
+    # Split on ';', trim parts, drop empties, join with ', '
+    parts = [p.strip() for p in str(value).split(";")]
+    parts = [p for p in parts if p]
+    return ", ".join(parts)
+
+
 @app.function_name(name="GetMDRATE")
 @app.route(route="getmdrate", methods=["GET"], auth_level=func.AuthLevel.FUNCTION)
 def get_mdrate(req: func.HttpRequest) -> func.HttpResponse:
@@ -108,11 +123,11 @@ def get_mdrate(req: func.HttpRequest) -> func.HttpResponse:
         "cp_postdischargereferral",
         "cp_detoxtype",
         "cp_medicaldischargedate",
-        "cp_pseudoname",                   # <-- moved here (on admissions)
+        "cp_pseudoname",
         "_cp_opioidagonisttherapy_value"
     ])
     contact_select = ",".join([
-        # contact fields ONLY (cp_pseudoname removed)
+        # contact fields ONLY
         "cp_ahcnumber",
         "cp_clientoutofprovince",
         "address1_postalcode",
@@ -177,10 +192,14 @@ def get_mdrate(req: func.HttpRequest) -> func.HttpResponse:
         opioid_lookup_id = rec.get("_cp_opioidagonisttherapy_value")
         opioid_name = fetch_substance_name(opioid_lookup_id)
 
+        # Pull formatted values when available, then normalize multi-choice separators
+        contributing = normalize_multichoice(get_value(rec, "cp_contributingfactors"))
+        post_referrals = normalize_multichoice(get_value(rec, "cp_postdischargereferral"))
+
         vals = [
             get_value(contact, "cp_ahcnumber"),                 # 1 (Contact)
             get_value(contact, "cp_clientoutofprovince"),       # 2 (Contact)
-            get_value(rec, "cp_pseudoname"),                    # 3 (Admissions) <-- fixed
+            get_value(rec, "cp_pseudoname"),                    # 3 (Admissions)
             get_value(rec, "cp_servicerequestdate"),            # 4 (Admissions)
             get_value(rec, "cp_admissiondate"),                 # 5 (Admissions)
             get_value(rec, "cp_actualdischargedate"),           # 6 (Admissions)
@@ -189,12 +208,12 @@ def get_mdrate(req: func.HttpRequest) -> func.HttpResponse:
             get_value(contact, "cp_age"),                       # 9 (Contact)
             get_value(rec, "cp_primarysubstanceused"),          # 10 (Admissions)
             get_value(rec, "cp_othersubstances"),               # 11 (Admissions)
-            get_value(rec, "cp_contributingfactors"),           # 12 (Admissions)
+            contributing,                                       # 12 (Admissions multi-choice normalized)
             get_value(rec, "cp_incomesource"),                  # 13 (Admissions)
             opioid_name,                                        # 14 (from cp_substances)
             get_value(rec, "cp_reasonfordischargemdrate"),      # 15 (Admissions)
             get_value(rec, "cp_reasonforhospitaladmissionmdrate"),  # 16 (Admissions)
-            get_value(rec, "cp_postdischargereferral"),         # 17 (Admissions)
+            post_referrals,                                     # 17 (Admissions multi-choice normalized)
             get_value(contact, "cp_mrpnumber")                  # 18 (Contact)
         ]
         line = "\t".join(fmt_cell(v) for v in vals) + "\n "
