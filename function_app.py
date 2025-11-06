@@ -184,7 +184,7 @@ def get_mdrate(req: func.HttpRequest) -> func.HttpResponse:
         detoxtype = rec.get("cp_detoxtype")
         med_disc = rec.get("cp_medicaldischargedate")
         is_med = (detoxtype == 121570000) or (detoxtype == 121570001 and med_disc is not None)
-        is_soc = (detoxtype == 121570001) and (med_disc is None)
+        is_soc = (detoxtype == 121570001)
         if not (is_med or is_soc):
             continue
 

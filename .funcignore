@@ -6,3 +6,18 @@ __queuestorage__
 local.settings.json
 test
 .venv
+
+# keep the package light
+.vscode/
+.venv/
+.python_packages/
+__pycache__/
+.git/
+.gitignore
+*.pyc
+*.pyo
+local.settings.json
+.env
+node_modules/
+tests/
+data/
