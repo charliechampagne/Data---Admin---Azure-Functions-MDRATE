@@ -2,45 +2,66 @@ import os
 import json
 import re
 import requests
-from datetime import datetime, timezone
+from datetime import datetime, timezone, tzinfo, timedelta
 
 import azure.functions as func
 from azure.functions import FunctionApp
 from msal import ConfidentialClientApplication
 
+# ---- Robust Calgary timezone loader ----
+def _load_calgary_tz() -> tzinfo:
+    # Try stdlib zoneinfo with tzdata
+    try:
+        from zoneinfo import ZoneInfo  # Python 3.9+
+        return ZoneInfo("America/Edmonton")
+    except Exception:
+        pass
+    # Try python-dateutil if available
+    try:
+        from dateutil.tz import gettz
+        tz = gettz("America/Edmonton")
+        if tz is not None:
+            return tz
+    except Exception:
+        pass
+    # Last-resort fixed offset (no DST). Better than crashing.
+    class _FixedOffset(tzinfo):
+        def __init__(self, minutes):
+            self._offset = timedelta(minutes=minutes)
+        def utcoffset(self, dt): return self._offset
+        def tzname(self, dt):    return "MST"
+        def dst(self, dt):       return timedelta(0)
+    return _FixedOffset(-7 * 60)
+
+CALGARY_TZ = _load_calgary_tz()
+
 app = FunctionApp()
 
+# ----------------- Helpers -----------------
 
-def month_bounds_utc(now_utc):
-    """Return (start_iso_z, end_iso_z) for the current calendar month in UTC with Z suffix."""
-    start = now_utc.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    if start.month == 12:
-        end = start.replace(year=start.year + 1, month=1)
+def last_month_bounds_utc(now_utc: datetime):
+    """
+    Return UTC (Z) bounds for previous calendar month:
+    [start_of_last_month, start_of_this_month)
+    """
+    this_month_start = now_utc.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    if this_month_start.month == 1:
+        last_start = this_month_start.replace(year=this_month_start.year - 1, month=12)
     else:
-        end = start.replace(month=start.month + 1)
-    return start.strftime("%Y-%m-%dT%H:%M:%SZ"), end.strftime("%Y-%m-%dT%H:%M:%SZ")
-
+        last_start = this_month_start.replace(month=this_month_start.month - 1)
+    last_end = this_month_start
+    return last_start.strftime("%Y-%m-%dT%H:%M:%SZ"), last_end.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 def fmt_cell(val, na="NA"):
-    """Normalize for tab output: empty -> NA; ISO date -> YYYY-MM-DD; bool -> Yes/No."""
     if val is None or val == "":
         return na
     if isinstance(val, bool):
         return "Yes" if val else "No"
     if isinstance(val, (int, float)):
         return str(val)
-    s = str(val)
-    # Try to normalize ISO timestamps to YYYY-MM-DD
-    try:
-        if "T" in s:
-            return datetime.fromisoformat(s.replace("Z", "+00:00")).date().isoformat()
-    except Exception:
-        pass
-    return s
-
+    return str(val)
 
 def get_value(obj, field):
-    """Prefer formatted annotation if present, else raw."""
     if not obj:
         return ""
     fmt_key = f"{field}@OData.Community.Display.V1.FormattedValue"
@@ -48,35 +69,52 @@ def get_value(obj, field):
         return obj[fmt_key]
     return obj.get(field, "")
 
-
 def sanitize_guid(g):
-    """Return GUID in canonical form without braces/spaces if present."""
     if not g:
         return ""
     s = str(g).strip().strip("{}").strip()
     m = re.search(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", s)
     return m.group(0) if m else s
 
-
 def normalize_multichoice(value: str) -> str:
-    """
-    Dataverse formats multi-select choice labels with semicolons like:
-      'A; B; C'
-    Convert to:
-      'A, B, C'
-    """
     if not value:
         return value
-    # Split on ';', trim parts, drop empties, join with ', '
     parts = [p.strip() for p in str(value).split(";")]
     parts = [p for p in parts if p]
     return ", ".join(parts)
 
+def utc_to_calgary_str(dt_val) -> str:
+    """
+    Convert OData DateTimeOffset (UTC) to Calgary local 'MM/DD/YYYY HH:MM AM/PM'.
+    Accepts ISO string or datetime.
+    """
+    if not dt_val:
+        return "NA"
+    # Parse input
+    if isinstance(dt_val, str):
+        s = dt_val.strip()
+        try:
+            if s.endswith("Z"):
+                dt_utc = datetime.fromisoformat(s.replace("Z", "+00:00"))
+            else:
+                parsed = datetime.fromisoformat(s)
+                dt_utc = parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+        except Exception:
+            return s
+    elif isinstance(dt_val, datetime):
+        dt_utc = dt_val if dt_val.tzinfo else dt_val.replace(tzinfo=timezone.utc)
+    else:
+        return str(dt_val)
+    # Convert
+    local_dt = dt_utc.astimezone(CALGARY_TZ)
+    return local_dt.strftime("%m/%d/%Y %I:%M %p")
+
+# ----------------- Function -----------------
 
 @app.function_name(name="GetMDRATE")
 @app.route(route="getmdrate", methods=["GET"], auth_level=func.AuthLevel.FUNCTION)
 def get_mdrate(req: func.HttpRequest) -> func.HttpResponse:
-    # --- Config / Auth ---
+    # Config / Auth
     try:
         tenant_id = os.environ["TENANT_ID"]
         client_id = os.environ["CLIENT_ID"]
@@ -105,12 +143,11 @@ def get_mdrate(req: func.HttpRequest) -> func.HttpResponse:
         "Prefer": 'odata.include-annotations="OData.Community.Display.V1.FormattedValue"'
     }
 
-    # --- Date filter for current month (UTC) ---
-    start_z, end_z = month_bounds_utc(datetime.now(timezone.utc))
+    # Last month filter (UTC Z)
+    start_z, end_z = last_month_bounds_utc(datetime.now(timezone.utc))
 
-    # --- Admissions request with $expand=cp_Client (capital C) ---
+    # Admissions with $expand=cp_Client
     admissions_select = ",".join([
-        # admissions fields (include cp_pseudoname here)
         "cp_servicerequestdate",
         "cp_admissiondate",
         "cp_actualdischargedate",
@@ -127,7 +164,6 @@ def get_mdrate(req: func.HttpRequest) -> func.HttpResponse:
         "_cp_opioidagonisttherapy_value"
     ])
     contact_select = ",".join([
-        # contact fields ONLY
         "cp_ahcnumber",
         "cp_clientoutofprovince",
         "address1_postalcode",
@@ -141,7 +177,7 @@ def get_mdrate(req: func.HttpRequest) -> func.HttpResponse:
     params = {
         "$select": admissions_select,
         "$filter": filter_str,
-        "$expand": f"cp_Client($select={contact_select})"  # navigation property name usually cp_Client
+        "$expand": f"cp_Client($select={contact_select})"
     }
 
     try:
@@ -157,7 +193,7 @@ def get_mdrate(req: func.HttpRequest) -> func.HttpResponse:
     except Exception:
         return func.HttpResponse("Failed to parse admissions JSON.", status_code=500)
 
-    # --- Substance lookup resolver (still separate call) ---
+    # Substance name resolver
     def fetch_substance_name(substance_guid):
         guid = sanitize_guid(substance_guid)
         if not guid:
@@ -176,45 +212,49 @@ def get_mdrate(req: func.HttpRequest) -> func.HttpResponse:
                 return ""
         return ""
 
-    # --- Build rows ---
-    medical_rows = []
-    social_rows = []
+    # Build rows
+    medical_rows, social_rows = [], []
 
     for rec in admissions:
         detoxtype = rec.get("cp_detoxtype")
         med_disc = rec.get("cp_medicaldischargedate")
         is_med = (detoxtype == 121570000) or (detoxtype == 121570001 and med_disc is not None)
-        is_soc = (detoxtype == 121570001)
+        is_soc = (detoxtype == 121570001) and (med_disc is None)
         if not (is_med or is_soc):
             continue
 
-        contact = rec.get("cp_Client") or {}  # from $expand
+        contact = rec.get("cp_Client") or {}
         opioid_lookup_id = rec.get("_cp_opioidagonisttherapy_value")
         opioid_name = fetch_substance_name(opioid_lookup_id)
 
-        # Pull formatted values when available, then normalize multi-choice separators
+        # Normalize multi-choice labels
         contributing = normalize_multichoice(get_value(rec, "cp_contributingfactors"))
         post_referrals = normalize_multichoice(get_value(rec, "cp_postdischargereferral"))
 
+        # Use raw datetime values -> convert to Calgary local
+        srd_raw  = rec.get("cp_servicerequestdate")
+        adm_raw  = rec.get("cp_admissiondate")
+        disc_raw = rec.get("cp_actualdischargedate")
+
         vals = [
-            get_value(contact, "cp_ahcnumber"),                 # 1 (Contact)
-            get_value(contact, "cp_clientoutofprovince"),       # 2 (Contact)
-            get_value(rec, "cp_pseudoname"),                    # 3 (Admissions)
-            get_value(rec, "cp_servicerequestdate"),            # 4 (Admissions)
-            get_value(rec, "cp_admissiondate"),                 # 5 (Admissions)
-            get_value(rec, "cp_actualdischargedate"),           # 6 (Admissions)
-            get_value(contact, "address1_postalcode"),          # 7 (Contact)
-            get_value(contact, "cp_gender"),                    # 8 (Contact)
-            get_value(contact, "cp_age"),                       # 9 (Contact)
-            get_value(rec, "cp_primarysubstanceused"),          # 10 (Admissions)
-            get_value(rec, "cp_othersubstances"),               # 11 (Admissions)
-            contributing,                                       # 12 (Admissions multi-choice normalized)
-            get_value(rec, "cp_incomesource"),                  # 13 (Admissions)
-            opioid_name,                                        # 14 (from cp_substances)
-            get_value(rec, "cp_reasonfordischargemdrate"),      # 15 (Admissions)
-            get_value(rec, "cp_reasonforhospitaladmissionmdrate"),  # 16 (Admissions)
-            post_referrals,                                     # 17 (Admissions multi-choice normalized)
-            get_value(contact, "cp_mrpnumber")                  # 18 (Contact)
+            get_value(contact, "cp_ahcnumber"),
+            get_value(contact, "cp_clientoutofprovince"),
+            get_value(rec, "cp_pseudoname"),
+            utc_to_calgary_str(srd_raw),
+            utc_to_calgary_str(adm_raw),
+            utc_to_calgary_str(disc_raw),
+            get_value(contact, "address1_postalcode"),
+            get_value(contact, "cp_gender"),
+            get_value(contact, "cp_age"),
+            get_value(rec, "cp_primarysubstanceused"),
+            get_value(rec, "cp_othersubstances"),
+            contributing,
+            get_value(rec, "cp_incomesource"),
+            opioid_name,
+            get_value(rec, "cp_reasonfordischargemdrate"),
+            get_value(rec, "cp_reasonforhospitaladmissionmdrate"),
+            post_referrals,
+            get_value(contact, "cp_mrpnumber")
         ]
         line = "\t".join(fmt_cell(v) for v in vals) + "\n "
         if is_med:
@@ -230,7 +270,9 @@ def get_mdrate(req: func.HttpRequest) -> func.HttpResponse:
     )
 
     medical_report = header + "\n " + ("".join(medical_rows) if medical_rows else "")
-    social_report = header + "\n " + ("".join(social_rows) if social_rows else "")
+    social_report  = header + "\n " + ("".join(social_rows)  if social_rows  else "")
 
-    body = {"medical_report": medical_report, "social_report": social_report}
-    return func.HttpResponse(json.dumps(body), mimetype="application/json")
+    return func.HttpResponse(
+        json.dumps({"medical_report": medical_report, "social_report": social_report}),
+        mimetype="application/json"
+    )
